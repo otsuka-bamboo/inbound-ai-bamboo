@@ -1,16 +1,15 @@
+import os
+import json
+import requests
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-# OpenAI SDK (v1系)
-try:
-    from openai import OpenAI
-    has_openai_v1 = True
-except Exception:
-    has_openai_v1 = False
-
+# -----------------------------
+# 基本設定
+# -----------------------------
 st.set_page_config(page_title="Inbound AI Dashboard", layout="wide")
-st.title("🌏 訪日外国人分析 × AI改善提案（プロトタイプ）")
+st.title("🌏 訪日外国人分析 × AI改善提案（プロトタイプ・SDK非依存版）")
 
 st.markdown("""
 このデモは、**国別データ**（訪日客数・宿泊単価・口コミスコア）をもとに、
@@ -19,13 +18,25 @@ CSVをアップロードするか、下の**デモデータ**で動作します�
 """)
 
 # -----------------------------
+# サイドバー：APIキー入力（Secrets優先）
+# -----------------------------
+with st.sidebar:
+    st.subheader("🔐 OpenAI API Key")
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        api_key = st.text_input("Enter OPENAI_API_KEY", type="password",
+                                help="デモ用の一時入力。保存されません。")
+        if st.button("Save key (session)"):
+            st.session_state["OPENAI_API_KEY"] = api_key
+    api_key = st.session_state.get("OPENAI_API_KEY") or api_key
+
+# -----------------------------
 # 1) データ入力
 # -----------------------------
 st.subheader("1️⃣ データ入力（CSV アップロード推奨）")
 st.caption("列名の例：国名,訪日客数,宿泊単価,口コミスコア")
 
 uploaded = st.file_uploader("CSVを選択してください（未選択ならデモデータを使用）", type=["csv"])
-
 if uploaded:
     df = pd.read_csv(uploaded)
 else:
@@ -37,7 +48,6 @@ else:
         "口コミスコア": [4.3, 4.1, 3.8, 4.6, 4.4]
     })
 
-# 最低限の列チェック
 required_cols = {"国名", "訪日客数", "宿泊単価", "口コミスコア"}
 if not required_cols.issubset(set(df.columns)):
     st.error(f"CSVの列名が不足しています。必要な列: {', '.join(required_cols)}")
@@ -63,22 +73,13 @@ with c2:
     fig2.update_layout(xaxis_title="口コミスコア（★）", yaxis_title="宿泊単価（円）")
     st.plotly_chart(fig2, use_container_width=True)
 
+with st.expander("AIに渡す表（確認用）", expanded=False):
+    st.dataframe(df)
+
 # -----------------------------
-# 3) AI 改善提案
+# 3) AI 改善提案（HTTP直叩き）
 # -----------------------------
 st.subheader("3️⃣ AI 改善提案（最大3項目、定量効果つき）")
-
-api_ok = False
-if "OPENAI_API_KEY" in st.secrets:
-    try:
-        if has_openai_v1:
-            client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-            api_ok = True
-    except Exception as e:
-        st.warning(f"OpenAIクライアント初期化に失敗：{e}")
-
-with st.expander("AIに渡している表（確認用）", expanded=False):
-    st.dataframe(df)
 
 prompt = f"""
 あなたは訪日観光コンサルタントです。
@@ -94,25 +95,42 @@ prompt = f"""
 {df.to_markdown(index=False)}
 """
 
-btn = st.button("💡 AI提案を生成する")
-if btn:
-    if not api_ok:
-        st.error("OpenAIのAPIキーが設定されていません。[App settings → Secrets] に `OPENAI_API_KEY` を保存してください。")
-    else:
-        with st.spinner("AIが分析中…"):
-            try:
-                chat = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "あなたは実務派の観光・ホテル再生コンサルタントです。短く、要点を定量で。"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.6,
-                    max_tokens=600
-                )
-                st.success("改善提案")
-                st.markdown(chat.choices[0].message.content)
-            except Exception as e:
-                st.error(f"AI呼び出しでエラーが発生しました：{e}")
+def call_openai_chat(api_key: str, prompt: str) -> str:
+    """
+    OpenAIのChat Completions APIをHTTPで直接叩く（SDK非依存）。
+    """
+    if not api_key:
+        return "（APIキー未設定：左サイドバーに入力、またはSecretsに保存してください）"
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "あなたは実務派の観光・ホテル再生コンサルタントです。短く、要点を定量で。"},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.6,
+        "max_tokens": 600,
+    }
+
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+    if resp.status_code != 200:
+        return f"（AI呼び出しエラー: {resp.status_code} {resp.text[:200]}）"
+
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return f"（予期しない応答形式: {str(data)[:200]}）"
+
+if st.button("💡 AI提案を生成する"):
+    with st.spinner("AIが分析中…"):
+        result = call_openai_chat(api_key, prompt)
+        st.success("改善提案")
+        st.markdown(result)
 
 st.caption("※ 本プロトタイプはデモ用。実運用では観光庁・JNTO・OTA・口コミAPIなどを自動連携予定。")
